@@ -1,0 +1,10 @@
+[project]
+name = "opuscord"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.75.0",
+    "discord-py-self>=2.0.1",
+    "python-dotenv>=1.2.1",
+]
