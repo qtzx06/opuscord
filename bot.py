@@ -15,6 +15,7 @@ load_dotenv()
 
 LIVE_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "live_history.json")
 EMBEDDINGS_FILE = os.path.join(os.path.dirname(__file__), "embeddings.npz")
+MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory.txt")
 
 client = discord.Client()
 anthropic = Anthropic()
@@ -30,6 +31,10 @@ conversations = defaultdict(list)
 MAX_MEMORY = 50
 message_counter = defaultdict(int)  # track msgs since last interjection
 last_response_counter = defaultdict(int)  # msgs since opus last spoke
+
+# live context state - updated by background awareness
+conversation_state = defaultdict(str)  # channel_id -> current state summary
+state_update_counter = defaultdict(int)  # track msgs since last state update
 
 # historical messages from JSON export
 chat_history = []
@@ -126,6 +131,117 @@ def load_history():
 
 # save on exit
 atexit.register(save_live_history)
+
+# global memory from full history analysis
+gc_memory = ""
+
+
+def load_memory():
+    """Load the memory dump if it exists"""
+    global gc_memory
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, 'r') as f:
+            gc_memory = f.read()
+        print(f"loaded memory ({len(gc_memory)} chars)")
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def summarize_chunk(args):
+    """Summarize a single chunk"""
+    chunk_text, chunk_num, total = args
+    try:
+        response = anthropic.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=300,
+            system="""summarize this chunk of discord messages. extract:
+- key topics discussed
+- notable events or moments
+- who said what (important stuff only)
+- any inside jokes or recurring themes
+- what people are working on or interested in
+
+be concise but capture the important stuff.""",
+            messages=[{"role": "user", "content": chunk_text}]
+        )
+        summary = response.content[0].text.strip()
+        print(f"  [{chunk_num}/{total}] {summary[:100]}...")
+        return (chunk_num, summary)
+    except Exception as e:
+        print(f"  [{chunk_num}/{total}] error: {e}")
+        return (chunk_num, None)
+
+
+def build_memory_dump():
+    """Process all messages and build a comprehensive memory dump"""
+    global gc_memory
+
+    if not chat_history:
+        print("no messages to process")
+        return
+
+    print(f"building memory dump from {len(chat_history)} messages...")
+
+    # process in chunks of 500 messages
+    chunk_size = 500
+    chunks = []
+    for i in range(0, len(chat_history), chunk_size):
+        chunk = chat_history[i:i + chunk_size]
+        chunk_text = "\n".join([f"{m['author']}: {m['content']}" for m in chunk])
+        chunks.append((chunk_text, len(chunks) + 1, (len(chat_history) + chunk_size - 1) // chunk_size))
+
+    total = len(chunks)
+    print(f"processing {total} chunks with 10 parallel workers...")
+
+    # process with thread pool
+    chunk_summaries = [None] * total
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(summarize_chunk, chunk): chunk[1] for chunk in chunks}
+        for future in as_completed(futures):
+            chunk_num, summary = future.result()
+            if summary:
+                chunk_summaries[chunk_num - 1] = summary
+
+    # filter out None values
+    chunk_summaries = [s for s in chunk_summaries if s]
+
+    # now combine all summaries into final memory
+    print("\ncombining summaries into final memory...")
+
+    combined = "\n\n---\n\n".join(chunk_summaries)
+
+    try:
+        response = anthropic.messages.create(
+            model="claude-opus-4-5-20251101",
+            max_tokens=2000,
+            system="""you're creating a memory dump for an AI that lives in this discord gc.
+
+combine these chunk summaries into a comprehensive memory document. include:
+- who the main people are and their personalities/interests
+- major events and storylines
+- inside jokes and recurring themes
+- what people work on or care about
+- the overall vibe and dynamics
+
+this will be used as persistent context so the AI understands the gc history.
+write in second person like "you know that josh...".""",
+            messages=[{"role": "user", "content": f"Chunk summaries:\n\n{combined}"}]
+        )
+
+        gc_memory = response.content[0].text.strip()
+
+        # save to file
+        with open(MEMORY_FILE, 'w') as f:
+            f.write(gc_memory)
+
+        print(f"\n=== FINAL MEMORY DUMP ===\n")
+        print(gc_memory)
+        print(f"\n=========================")
+        print(f"saved to memory.txt ({len(gc_memory)} chars)")
+
+    except Exception as e:
+        print(f"final memory error: {e}")
 
 
 def save_embeddings():
@@ -300,6 +416,40 @@ def get_user_analysis(user_name):
     return None
 
 
+async def update_conversation_state(channel_id, recent_messages):
+    """Use haiku to maintain awareness of what's happening"""
+    global conversation_state
+
+    if len(recent_messages) < 3:
+        return
+
+    current_state = conversation_state[channel_id]
+    recent_text = "\n".join([f"{m['author']}: {m['content']}" for m in recent_messages[-15:]])
+
+    try:
+        response = anthropic.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=200,
+            system="""you're tracking what's happening in a group chat. maintain a brief state summary.
+
+update the state based on new messages. track:
+- current topic/conversation
+- what people are doing/working on
+- any ongoing threads or jokes
+- mood/vibe
+
+keep it brief, 2-4 sentences. just facts, no commentary.""",
+            messages=[{"role": "user", "content": f"Previous state:\n{current_state or 'none yet'}\n\nRecent messages:\n{recent_text}\n\nUpdated state:"}]
+        )
+
+        new_state = response.content[0].text.strip()
+        conversation_state[channel_id] = new_state
+        print(f"state updated: {new_state[:100]}...")
+
+    except Exception as e:
+        print(f"state update error: {e}")
+
+
 def should_interject(recent_messages):
     """Use haiku to decide if opus should randomly chime in (cheap check)"""
     if len(recent_messages) < 3:
@@ -426,6 +576,7 @@ async def on_ready():
     print(f"watching channel: {TARGET_CHANNEL_ID}")
     load_history()
     load_embeddings()
+    load_memory()
 
     # scrape messages on startup
     channel = client.get_channel(TARGET_CHANNEL_ID)
@@ -441,6 +592,11 @@ async def on_ready():
 
     # build embeddings for any new messages
     build_embeddings()
+
+    # build memory dump if doesn't exist
+    if not gc_memory and len(chat_history) > 100:
+        print("no memory found, building memory dump...")
+        build_memory_dump()
 
 
 @client.event
@@ -473,6 +629,12 @@ async def on_message(message):
 
     message_counter[message.channel.id] += 1
     last_response_counter[message.channel.id] += 1
+    state_update_counter[message.channel.id] += 1
+
+    # update conversation state every 5 messages
+    if state_update_counter[message.channel.id] >= 5:
+        state_update_counter[message.channel.id] = 0
+        await update_conversation_state(message.channel.id, conversations[message.channel.id])
 
     # direct trigger: mention or keyword
     msg_lower = message.content.lower()
@@ -511,6 +673,16 @@ async def on_message(message):
     recent = conversations[message.channel.id]
     recent_context = "\n".join([f"{m['author']}: {m['content']}" for m in recent])
 
+    # include live state if available
+    state_context = ""
+    if conversation_state[message.channel.id]:
+        state_context = f"\n\ncurrent vibe: {conversation_state[message.channel.id]}"
+
+    # include memory dump
+    memory_context = ""
+    if gc_memory:
+        memory_context = f"\n\nyour memory of this gc:\n{gc_memory}"
+
     # RAG for direct triggers only (saves tokens on random interjections)
     history_context = ""
     user_analysis = ""
@@ -534,7 +706,7 @@ async def on_message(message):
         try:
             if random_trigger:
                 # random interjection - use haiku for speed/cost
-                full_context = f"chat:\n{recent_context}"
+                full_context = f"{memory_context}{state_context}\n\nchat:\n{recent_context}"
                 response = anthropic.messages.create(
                     model="claude-3-5-haiku-20241022",
                     max_tokens=150,
@@ -542,8 +714,8 @@ async def on_message(message):
                     messages=[{"role": "user", "content": full_context}]
                 )
             else:
-                # direct trigger - use sonnet with full context
-                full_context = f"recent:\n{recent_context}{history_context}{user_analysis}"
+                # direct trigger - use opus with full context
+                full_context = f"{memory_context}{state_context}\n\nrecent:\n{recent_context}{history_context}{user_analysis}"
                 response = anthropic.messages.create(
                     model="claude-opus-4-5-20251101",
                     max_tokens=400,
