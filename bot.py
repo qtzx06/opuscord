@@ -29,6 +29,7 @@ HISTORY_FILE = os.getenv("HISTORY_FILE", "")
 conversations = defaultdict(list)
 MAX_MEMORY = 50
 message_counter = defaultdict(int)  # track msgs since last interjection
+last_response_counter = defaultdict(int)  # msgs since opus last spoke
 
 # historical messages from JSON export
 chat_history = []
@@ -310,19 +311,26 @@ def should_interject(recent_messages):
         response = anthropic.messages.create(
             model="claude-3-5-haiku-20241022",
             max_tokens=100,
-            system="""decide if opus should chime in. opus is a knowledgeable friend in the gc, not an assistant.
+            system="""decide if opus should chime in. opus is a regular person in the gc who talks naturally.
 
 say yes when:
-- someone's working on something interesting worth asking about
-- there's a technical thing to add or correct
-- good opportunity for natural humor or banter
-- unanswered question you can help with
+- conversation is flowing and there's an opening
+- someone said something you could react to
+- there's banter or jokes happening
+- someone asked a question
+- you have something relevant to add
+- natural moment to join in
+
+say no when:
+- people are having a private moment
+- you just talked recently
+- nothing interesting happening
 
 reply ONLY:
-- "no" (most of the time - don't be annoying)
-- "yes: [brief reason]"
+- "no"
+- "yes: [what to say about]"
 
-be selective. ~20% yes.""",
+be natural. ~50% yes.""",
             messages=[{"role": "user", "content": f"Recent chat:\n{context}"}]
         )
 
@@ -464,6 +472,7 @@ async def on_message(message):
     user_profiles[author_id]["messages"].append(message.content)
 
     message_counter[message.channel.id] += 1
+    last_response_counter[message.channel.id] += 1
 
     # direct trigger: mention or keyword
     msg_lower = message.content.lower()
@@ -473,15 +482,27 @@ async def on_message(message):
         "claude" in msg_lower
     )
 
-    # random interjection check (every 4-8 messages)
+    # conversation continuation - keep talking if we just spoke
+    msgs_since_opus = last_response_counter[message.channel.id]
+    in_active_convo = msgs_since_opus <= 2
+
+    # random interjection check
     random_trigger = False
     interject_reason = None
 
-    if not direct_trigger and message_counter[message.channel.id] >= random.randint(4, 8):
-        message_counter[message.channel.id] = 0
-        random_trigger, interject_reason = should_interject(conversations[message.channel.id])
-        if random_trigger:
-            print(f"interjecting because: {interject_reason}")
+    if not direct_trigger:
+        if in_active_convo:
+            # we're in a conversation - high chance to continue
+            if random.random() < 0.7:  # 70% chance to keep talking
+                random_trigger = True
+                interject_reason = "continuing conversation"
+                print(f"continuing convo (msg #{msgs_since_opus} since opus)")
+        elif message_counter[message.channel.id] >= random.randint(2, 4):
+            # not in active convo - regular interjection check
+            message_counter[message.channel.id] = 0
+            random_trigger, interject_reason = should_interject(conversations[message.channel.id])
+            if random_trigger:
+                print(f"interjecting because: {interject_reason}")
 
     if not direct_trigger and not random_trigger:
         return
@@ -524,7 +545,7 @@ async def on_message(message):
                 # direct trigger - use sonnet with full context
                 full_context = f"recent:\n{recent_context}{history_context}{user_analysis}"
                 response = anthropic.messages.create(
-                    model="claude-opus-4-5-20250514",
+                    model="claude-opus-4-5-20251101",
                     max_tokens=400,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": full_context}]
@@ -536,6 +557,9 @@ async def on_message(message):
                 reply = reply[:1900] + "..."
 
             await message.channel.send(reply)
+
+            # reset conversation counter - opus just spoke
+            last_response_counter[message.channel.id] = 0
 
             conversations[message.channel.id].append({
                 "author": "opus",
