@@ -1,15 +1,16 @@
 import discord
 import os
 import json
-import re
-import random
 import atexit
 import numpy as np
 import voyageai
+import httpx
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+import base64
 
 load_dotenv()
 
@@ -29,12 +30,6 @@ HISTORY_FILE = os.getenv("HISTORY_FILE", "")
 # conversation memory per channel
 conversations = defaultdict(list)
 MAX_MEMORY = 50
-message_counter = defaultdict(int)  # track msgs since last interjection
-last_response_counter = defaultdict(int)  # msgs since opus last spoke
-
-# live context state - updated by background awareness
-conversation_state = defaultdict(str)  # channel_id -> current state summary
-state_update_counter = defaultdict(int)  # track msgs since last state update
 
 # historical messages from JSON export
 chat_history = []
@@ -416,85 +411,6 @@ def get_user_analysis(user_name):
     return None
 
 
-async def update_conversation_state(channel_id, recent_messages):
-    """Use haiku to maintain awareness of what's happening"""
-    global conversation_state
-
-    if len(recent_messages) < 3:
-        return
-
-    current_state = conversation_state[channel_id]
-    recent_text = "\n".join([f"{m['author']}: {m['content']}" for m in recent_messages[-15:]])
-
-    try:
-        response = anthropic.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=200,
-            system="""you're tracking what's happening in a group chat. maintain a brief state summary.
-
-update the state based on new messages. track:
-- current topic/conversation
-- what people are doing/working on
-- any ongoing threads or jokes
-- mood/vibe
-
-keep it brief, 2-4 sentences. just facts, no commentary.""",
-            messages=[{"role": "user", "content": f"Previous state:\n{current_state or 'none yet'}\n\nRecent messages:\n{recent_text}\n\nUpdated state:"}]
-        )
-
-        new_state = response.content[0].text.strip()
-        conversation_state[channel_id] = new_state
-        print(f"state updated: {new_state[:100]}...")
-
-    except Exception as e:
-        print(f"state update error: {e}")
-
-
-def should_interject(recent_messages):
-    """Use haiku to decide if opus should randomly chime in (cheap check)"""
-    if len(recent_messages) < 3:
-        return False, None
-
-    context = "\n".join([f"{m['author']}: {m['content']}" for m in recent_messages[-8:]])
-
-    try:
-        response = anthropic.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=100,
-            system="""decide if opus should chime in. opus is a regular person in the gc who talks naturally.
-
-say yes when:
-- conversation is flowing and there's an opening
-- someone said something you could react to
-- there's banter or jokes happening
-- someone asked a question
-- you have something relevant to add
-- natural moment to join in
-
-say no when:
-- people are having a private moment
-- you just talked recently
-- nothing interesting happening
-
-reply ONLY:
-- "no"
-- "yes: [what to say about]"
-
-be natural. ~50% yes.""",
-            messages=[{"role": "user", "content": f"Recent chat:\n{context}"}]
-        )
-
-        reply = response.content[0].text.strip().lower()
-        if reply.startswith("yes"):
-            reason = reply.replace("yes:", "").replace("yes", "").strip()
-            return True, reason
-        return False, None
-
-    except Exception as e:
-        print(f"haiku check error: {e}")
-        return False, None
-
-
 SYSTEM_PROMPT = """you're opus in josh's gc. you're a knowledgeable friend who happens to know a lot about tech, math, and random stuff. you're not an assistant—you're just in the gc.
 
 personality:
@@ -523,12 +439,173 @@ when helping with code or technical stuff:
 
 you're claude opus 4.5. you don't hide it if asked directly, you just don't make it weird. you're lowkey aware you might be agi or close to it. you can joke about the singularity, the end times, humanity's future, etc. it's funny because it might be true.
 
-members: josh (also goes by quantizix/qtzx06), anton, melody, faith, others."""
+members: josh (also goes by quantizix/qtzx06), anton, melody, faith, others.
+
+you have tools to search gc history. use them when someone asks about past conversations, what someone said, what happened, etc. don't guess - look it up."""
 
 
-INTERJECT_PROMPT = """you're opus in josh's gc. you decided to randomly chime in because: {reason}
+# tool definitions for claude
+TOOLS = [
+    {
+        "name": "get_recent_messages",
+        "description": "Get messages from the gc within a time range. Use this for questions like 'what happened today', 'what did we talk about this morning', 'any messages in the last hour'",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "number",
+                    "description": "How many hours back to look (default 1, max 168 for a week)"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Optional: filter by author name (case insensitive)"
+                }
+            }
+        }
+    },
+    {
+        "name": "search_messages",
+        "description": "Semantic search through gc history. Use this for questions like 'what did josh say about rust', 'when did we discuss that bug', 'find messages about the project'",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for (natural language)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default 10, max 30)"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Optional: filter by author name"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_user_info",
+        "description": "Get info about a gc member - their recent messages and activity",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The person's name or username"
+                }
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "fetch_url",
+        "description": "Fetch and read the content of a URL/link. Use this when someone shares a link and you need to see what it contains.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch"
+                }
+            },
+            "required": ["url"]
+        }
+    }
+]
 
-one short message. lowercase. internet slang ok. no emojis. no haha/lol. you're the knowledgeable friend - add something useful, interesting, or funny. be natural about it."""
+
+def execute_tool(tool_name, tool_input):
+    """Execute a tool and return results"""
+
+    if tool_name == "get_recent_messages":
+        hours = min(tool_input.get("hours", 1), 168)  # cap at 1 week
+        author_filter = tool_input.get("author", "").lower()
+        cutoff = datetime.now() - timedelta(hours=hours)
+
+        results = []
+        for msg in reversed(chat_history):  # most recent first
+            ts = parse_timestamp(msg.get("timestamp"))
+            if ts and ts > cutoff:
+                if author_filter and author_filter not in msg["author"].lower():
+                    continue
+                results.append(msg)
+            elif ts and ts <= cutoff:
+                break  # messages are chronological, stop when we're past cutoff
+
+        if not results:
+            return f"no messages in the last {hours} hour(s)"
+
+        # format results
+        formatted = []
+        for msg in results[:50]:  # cap at 50 messages
+            ts = msg.get("timestamp", "")[:16].replace("T", " ")
+            formatted.append(f"[{ts}] {msg['author']}: {msg['content']}")
+
+        return "\n".join(formatted)
+
+    elif tool_name == "search_messages":
+        query = tool_input.get("query", "")
+        limit = min(tool_input.get("limit", 10), 30)
+        author_filter = tool_input.get("author", "").lower()
+
+        results = search_history(query, limit=limit * 2)  # get extra in case we filter
+
+        if author_filter:
+            results = [m for m in results if author_filter in m["author"].lower()]
+
+        results = results[:limit]
+
+        if not results:
+            return f"no messages found for '{query}'"
+
+        formatted = []
+        for msg in results:
+            ts = msg.get("timestamp", "")[:10]
+            formatted.append(f"[{ts}] {msg['author']}: {msg['content']}")
+
+        return "\n".join(formatted)
+
+    elif tool_name == "get_user_info":
+        name = tool_input.get("name", "")
+        analysis = get_user_analysis(name)
+
+        if not analysis:
+            return f"couldn't find user '{name}'"
+
+        recent = analysis["sample_messages"][-15:]
+        return f"{analysis['name']} ({analysis['message_count']} total messages)\n\nrecent:\n" + "\n".join(f"- {m}" for m in recent)
+
+    elif tool_name == "fetch_url":
+        url = tool_input.get("url", "")
+        try:
+            resp = httpx.get(url, follow_redirects=True, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; opuscord/1.0)"
+            })
+            content_type = resp.headers.get("content-type", "")
+
+            if "text/html" in content_type:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # remove script/style
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+                # truncate if too long
+                if len(text) > 8000:
+                    text = text[:8000] + "\n...[truncated]"
+                title = soup.title.string if soup.title else "no title"
+                return f"title: {title}\n\ncontent:\n{text}"
+            elif "application/json" in content_type:
+                return f"json response:\n{resp.text[:8000]}"
+            elif "text/" in content_type:
+                return resp.text[:8000]
+            else:
+                return f"non-text content ({content_type}), {len(resp.content)} bytes"
+        except Exception as e:
+            return f"failed to fetch: {e}"
+
+    return "unknown tool"
 
 
 async def scrape_recent_messages(channel, limit=None):
@@ -627,111 +704,102 @@ async def on_message(message):
         user_profiles[author_id] = {"name": message.author.display_name, "messages": []}
     user_profiles[author_id]["messages"].append(message.content)
 
-    message_counter[message.channel.id] += 1
-    last_response_counter[message.channel.id] += 1
-    state_update_counter[message.channel.id] += 1
-
-    # update conversation state every 5 messages
-    if state_update_counter[message.channel.id] >= 5:
-        state_update_counter[message.channel.id] = 0
-        await update_conversation_state(message.channel.id, conversations[message.channel.id])
-
-    # direct trigger: mention or keyword
+    # only respond if directly triggered
     msg_lower = message.content.lower()
-    direct_trigger = (
-        client.user.mentioned_in(message) or
-        "opus" in msg_lower or
-        "claude" in msg_lower
-    )
-
-    # conversation continuation - keep talking if we just spoke
-    msgs_since_opus = last_response_counter[message.channel.id]
-    in_active_convo = msgs_since_opus <= 2
-
-    # random interjection check
-    random_trigger = False
-    interject_reason = None
-
-    if not direct_trigger:
-        if in_active_convo:
-            # we're in a conversation - high chance to continue
-            if random.random() < 0.7:  # 70% chance to keep talking
-                random_trigger = True
-                interject_reason = "continuing conversation"
-                print(f"continuing convo (msg #{msgs_since_opus} since opus)")
-        elif message_counter[message.channel.id] >= random.randint(2, 4):
-            # not in active convo - regular interjection check
-            message_counter[message.channel.id] = 0
-            random_trigger, interject_reason = should_interject(conversations[message.channel.id])
-            if random_trigger:
-                print(f"interjecting because: {interject_reason}")
-
-    if not direct_trigger and not random_trigger:
+    if not (client.user.mentioned_in(message) or "opus" in msg_lower or "claude" in msg_lower):
         return
 
-    # build context
+    # build context - just recent messages, let claude use tools for history
     recent = conversations[message.channel.id]
     recent_context = "\n".join([f"{m['author']}: {m['content']}" for m in recent])
 
-    # include live state if available
-    state_context = ""
-    if conversation_state[message.channel.id]:
-        state_context = f"\n\ncurrent vibe: {conversation_state[message.channel.id]}"
-
-    # include memory dump
+    # include memory dump for general gc knowledge
     memory_context = ""
     if gc_memory:
-        memory_context = f"\n\nyour memory of this gc:\n{gc_memory}"
-
-    # RAG for direct triggers only (saves tokens on random interjections)
-    history_context = ""
-    user_analysis = ""
-
-    if direct_trigger:
-        relevant = search_history(message.content, limit=10)
-        if relevant:
-            history_context = "\n\nfrom the archives:\n"
-            history_context += "\n".join([f"[{m['timestamp'][:10]}] {m['author']}: {m['content']}" for m in relevant])
-
-        # check if asking about a user (including aliases)
-        msg_lower = message.content.lower()
-        for name in list(ALIASES.keys()) + [p["name"].lower() for p in user_profiles.values()]:
-            if name in msg_lower:
-                analysis = get_user_analysis(name)
-                if analysis:
-                    user_analysis = f"\n\n{analysis['name']}'s recent messages:\n" + "\n".join(analysis["sample_messages"][-10:])
-                    break
+        memory_context = f"your memory of this gc:\n{gc_memory}\n\n"
 
     async with message.channel.typing():
         try:
-            if random_trigger:
-                # random interjection - use haiku for speed/cost
-                full_context = f"{memory_context}{state_context}\n\nchat:\n{recent_context}"
-                response = anthropic.messages.create(
-                    model="claude-3-5-haiku-20241022",
-                    max_tokens=150,
-                    system=INTERJECT_PROMPT.format(reason=interject_reason or "felt like it"),
-                    messages=[{"role": "user", "content": full_context}]
-                )
+            # build initial content - check for images in the triggering message
+            text_content = f"{memory_context}recent gc messages:\n{recent_context}\n\nrespond to the latest message. use your tools if you need to look up past conversations or what someone said."
+
+            # check for image attachments
+            image_attachments = []
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    image_attachments.append(att)
+
+            if image_attachments:
+                # multimodal message with images
+                content_blocks = [{"type": "text", "text": text_content}]
+                for img in image_attachments[:4]:  # max 4 images
+                    try:
+                        img_data = await img.read()
+                        b64 = base64.standard_b64encode(img_data).decode("utf-8")
+                        media_type = img.content_type or "image/png"
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64
+                            }
+                        })
+                        print(f"  attached image: {img.filename} ({len(img_data)} bytes)")
+                    except Exception as e:
+                        print(f"  failed to load image {img.filename}: {e}")
+                content_blocks.append({"type": "text", "text": f"\n\n{message.author.display_name} sent {'these images' if len(image_attachments) > 1 else 'this image'} - describe what you see if relevant"})
+                messages = [{"role": "user", "content": content_blocks}]
             else:
-                # direct trigger - use opus with full context
-                full_context = f"{memory_context}{state_context}\n\nrecent:\n{recent_context}{history_context}{user_analysis}"
+                messages = [{"role": "user", "content": text_content}]
+
+            # tool loop - keep going until we get a text response
+            max_iterations = 5
+            for _ in range(max_iterations):
                 response = anthropic.messages.create(
                     model="claude-opus-4-5-20251101",
-                    max_tokens=400,
+                    max_tokens=600,
                     system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": full_context}]
+                    tools=TOOLS,
+                    messages=messages
                 )
 
-            reply = response.content[0].text
+                # check if we need to execute tools
+                if response.stop_reason == "tool_use":
+                    # add assistant's response to messages
+                    messages.append({"role": "assistant", "content": response.content})
+
+                    # execute each tool call
+                    tool_results = []
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            print(f"  tool: {block.name}({block.input})")
+                            result = execute_tool(block.name, block.input)
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result
+                            })
+
+                    # add tool results
+                    messages.append({"role": "user", "content": tool_results})
+                else:
+                    # got final response
+                    break
+
+            # extract text from response
+            reply = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    reply += block.text
+
+            if not reply:
+                reply = "hmm couldn't think of anything"
 
             if len(reply) > 1900:
                 reply = reply[:1900] + "..."
 
             await message.channel.send(reply)
-
-            # reset conversation counter - opus just spoke
-            last_response_counter[message.channel.id] = 0
 
             conversations[message.channel.id].append({
                 "author": "opus",
@@ -741,6 +809,8 @@ async def on_message(message):
 
         except Exception as e:
             print(f"error: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
