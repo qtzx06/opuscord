@@ -6,5 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.75.0",
     "discord-py-self>=2.0.1",
+    "numpy>=2.4.0",
     "python-dotenv>=1.2.1",
+    "voyageai>=0.3.7",
 ]
