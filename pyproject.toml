@@ -11,4 +11,6 @@ dependencies = [
     "numpy>=2.4.0",
     "python-dotenv>=1.2.1",
     "voyageai>=0.3.7",
+    "rank-bm25>=0.2.2",
+    "rapidfuzz>=3.9.0",
 ]
