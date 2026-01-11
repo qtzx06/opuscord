@@ -16,6 +16,8 @@ import base64
 from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz, process
 from functools import partial
+from PIL import Image
+import io
 
 load_dotenv()
 
@@ -279,6 +281,64 @@ atexit.register(save_session)
 
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def detect_image_type(data: bytes) -> str:
+    """Detect actual image type from magic bytes"""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    if data[:4] == b'GIF8':
+        return "image/gif"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    return None
+
+
+def compress_image(img_data: bytes, max_size_mb: float = 5.0, max_dimension: int = 2048) -> tuple[bytes, str]:
+    """Compress/resize image if too large. Returns (data, media_type)"""
+    try:
+        img = Image.open(io.BytesIO(img_data))
+        original_format = img.format or "PNG"
+
+        # resize if dimensions too large
+        if img.width > max_dimension or img.height > max_dimension:
+            ratio = min(max_dimension / img.width, max_dimension / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+        # convert to RGB if needed (for JPEG output)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            # keep as PNG if has transparency
+            output_format = "PNG"
+        else:
+            output_format = "JPEG" if len(img_data) > 1 * 1024 * 1024 else original_format
+
+        if img.mode == 'RGBA' and output_format == 'JPEG':
+            img = img.convert('RGB')
+
+        # compress
+        buffer = io.BytesIO()
+        if output_format == "JPEG":
+            quality = 85
+            img.save(buffer, format="JPEG", quality=quality, optimize=True)
+            # reduce quality if still too large
+            while buffer.tell() > max_size_mb * 1024 * 1024 and quality > 30:
+                buffer = io.BytesIO()
+                quality -= 10
+                img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        else:
+            img.save(buffer, format=output_format, optimize=True)
+
+        result = buffer.getvalue()
+        media_type = f"image/{output_format.lower()}"
+        return result, media_type
+    except Exception as e:
+        print(f"  image compression failed: {e}")
+        # return original with detected type
+        detected = detect_image_type(img_data)
+        return img_data, detected or "image/png"
 
 
 def summarize_chunk(args):
@@ -1104,9 +1164,9 @@ def _sync_execute_tool(tool_name, tool_input):
         if not results:
             return f"no messages in the last {hours} hour(s)"
 
-        # format results
+        # format results (chronological order - oldest first, newest last)
         formatted = []
-        for msg in results[:50]:  # cap at 50 messages
+        for msg in reversed(results[:50]):  # reverse so oldest is first
             ts = msg.get("timestamp", "")[:16].replace("T", " ")
             formatted.append(f"[{ts}] {msg['author']}: {msg['content']}")
 
@@ -1402,21 +1462,24 @@ def _sync_execute_tool(tool_name, tool_input):
             if resp.status_code != 200:
                 return f"failed to fetch image: HTTP {resp.status_code}"
 
-            content_type = resp.headers.get("content-type", "image/png")
-
-            # handle content type with charset
-            if ";" in content_type:
-                content_type = content_type.split(";")[0].strip()
+            # detect actual image type from magic bytes
+            content_type = detect_image_type(resp.content)
+            if not content_type:
+                # fallback to header
+                content_type = resp.headers.get("content-type", "image/png")
+                if ";" in content_type:
+                    content_type = content_type.split(";")[0].strip()
 
             if not content_type.startswith("image/"):
                 return f"not an image: {content_type}"
 
-            # check file size (skip if > 20MB)
-            if len(resp.content) > 20 * 1024 * 1024:
-                return "image too large (>20MB)"
+            # compress if large
+            img_data = resp.content
+            if len(img_data) > 1 * 1024 * 1024:
+                img_data, content_type = compress_image(img_data, max_size_mb=5.0, max_dimension=2048)
 
             # encode as base64
-            img_b64 = base64.standard_b64encode(resp.content).decode("utf-8")
+            img_b64 = base64.standard_b64encode(img_data).decode("utf-8")
 
             # build the prompt based on detail level and question
             if question:
@@ -1801,11 +1864,20 @@ async def on_message(message):
         return
 
     # store message in recent memory
+    attachments = []
+    for att in message.attachments:
+        attachments.append({
+            "filename": att.filename,
+            "url": att.url,
+            "content_type": att.content_type,
+            "size": att.size
+        })
     msg_data = {
         "author": message.author.display_name,
         "author_id": str(message.author.id),
         "content": message.content,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "attachments": attachments if attachments else None
     }
     conversations[message.channel.id].append(msg_data)
 
@@ -1823,12 +1895,24 @@ async def on_message(message):
 
     # only respond if directly triggered
     msg_lower = message.content.lower()
-    if not (client.user.mentioned_in(message) or "opus" in msg_lower or "claude" in msg_lower):
+    if not (client.user.mentioned_in(message) or "opus" in msg_lower or "claude" in msg_lower or "jarvis" in msg_lower):
         return
 
     # build context - just recent messages, let claude use tools for history
     recent = conversations[message.channel.id]
-    recent_context = "\n".join([f"{m['author']}: {m['content']}" for m in recent])
+
+    def format_msg(m):
+        text = f"{m['author']}: {m['content']}"
+        if m.get('attachments'):
+            img_count = sum(1 for a in m['attachments'] if a.get('content_type', '').startswith('image/'))
+            other_count = len(m['attachments']) - img_count
+            if img_count > 0:
+                text += f" [attached {img_count} image{'s' if img_count > 1 else ''}]"
+            if other_count > 0:
+                text += f" [attached {other_count} file{'s' if other_count > 1 else ''}]"
+        return text
+
+    recent_context = "\n".join([format_msg(m) for m in recent])
 
     # include memory dump for general gc knowledge
     memory_context = ""
@@ -1862,15 +1946,20 @@ async def on_message(message):
                 for img in image_attachments[:4]:  # max 4 images
                     try:
                         img_data = await img.read()
-                        # skip if too large (>10MB)
-                        if len(img_data) > 10 * 1024 * 1024:
-                            print(f"  skipping large image: {img.filename} ({len(img_data)} bytes)")
-                            continue
+                        original_size = len(img_data)
+                        # compress if large (>1MB) or huge dimensions
+                        if original_size > 1 * 1024 * 1024:
+                            print(f"  compressing large image: {img.filename} ({original_size} bytes)")
+                            img_data, media_type = compress_image(img_data, max_size_mb=5.0, max_dimension=2048)
+                            print(f"  compressed to {len(img_data)} bytes ({media_type})")
+                        else:
+                            # detect actual image type from magic bytes (discord sometimes lies)
+                            media_type = detect_image_type(img_data)
+                            if not media_type:
+                                media_type = img.content_type or "image/png"
+                                if ";" in media_type:
+                                    media_type = media_type.split(";")[0].strip()
                         b64 = base64.standard_b64encode(img_data).decode("utf-8")
-                        media_type = img.content_type or "image/png"
-                        # handle content type with charset
-                        if ";" in media_type:
-                            media_type = media_type.split(";")[0].strip()
                         content_blocks.append({
                             "type": "image",
                             "source": {
@@ -1886,7 +1975,8 @@ async def on_message(message):
 
                 if loaded_images > 0:
                     # add context about the image(s)
-                    img_prompt = f"\n\n[{message.author.display_name} attached {'these ' + str(loaded_images) + ' images' if loaded_images > 1 else 'this image'} to their message. you can see {'them' if loaded_images > 1 else 'it'} above. if they're asking about the image or it's relevant, describe/react to what you see. read any text in the image. if it's a meme, get the joke.]"
+                    msg_preview = message.content[:100] if message.content else "(no text)"
+                    img_prompt = f"\n\n[the image{'s' if loaded_images > 1 else ''} above {'are' if loaded_images > 1 else 'is'} from {message.author.display_name}'s latest message: \"{msg_preview}\". look at the actual image content and respond to what you see. if there's text in the image, read it. if it's a meme or screenshot, describe/react to it.]"
                     content_blocks.append({"type": "text", "text": img_prompt})
                     messages = [{"role": "user", "content": content_blocks}]
                 else:
